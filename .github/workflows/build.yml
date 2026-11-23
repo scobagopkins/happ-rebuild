@@ -61,6 +61,19 @@ jobs:
           print("static checks: resources and dex byte-identical to stock")
           PY
 
+      - name: Assert the manifest parses and carries the new id
+        run: |
+          set -euo pipefail
+          APK="Happ-${{ inputs.version }}-parallel.apk"
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)
+          if [ -z "$AAPT2" ]; then echo "no aapt2, skipping"; exit 0; fi
+          BAD=$("$AAPT2" dump badging "$APK" 2>&1 >/dev/null | grep -c "Bad string" || true)
+          echo "bad-string warnings: $BAD"
+          test "$BAD" = "0"
+          LINE=$("$AAPT2" dump badging "$APK" 2>/dev/null | head -1)
+          echo "$LINE"
+          echo "$LINE" | grep -q "name='${{ inputs.new_id }}'" || { echo "package id missing/empty"; exit 1; }
+
       - name: Sign
         run: |
           set -euo pipefail

@@ -49,7 +49,7 @@ def read_utf8(b, o):
     if m & 0x80:
         m = ((m & 0x7F) << 8) | b[o]
         o += 1
-    return b[o:o + m], o + m + 1
+    return o, m, b[o:o + m].decode("utf-8", "replace")
 
 
 def read_utf16(b, o):
@@ -58,7 +58,7 @@ def read_utf16(b, o):
     if n & 0x8000:
         n = ((n & 0x7FFF) << 16) | u16(b, o)
         o += 2
-    return b[o:o + 2 * n], o + 2 * n + 2
+    return o, 2 * n, b[o:o + 2 * n].decode("utf-16-le", "replace")
 
 
 def pool_strings(buf):
@@ -81,14 +81,12 @@ def pool_strings(buf):
             base = off + strings_start
             for i in range(count):
                 s_off = u32(buf, off + chdr + 4 * i)
-                start = base + s_off
+                entry = base + s_off
                 if utf8:
-                    raw, nxt = read_utf8(buf, start)
-                    value = raw.decode("utf-8", "replace")
+                    data_off, data_len, value = read_utf8(buf, entry)
                 else:
-                    raw, nxt = read_utf16(buf, start)
-                    value = raw.decode("utf-16-le", "replace")
-                yield start, len(raw), value, utf8
+                    data_off, data_len, value = read_utf16(buf, entry)
+                yield data_off, data_len, value, utf8
             return
         off += csize
     raise SystemExit("no string pool")
