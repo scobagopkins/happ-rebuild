@@ -1,0 +1,170 @@
+name: build-clean
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Happ version (e.g. 4.11.2)"
+        default: "4.11.2"
+        required: true
+      new_id:
+        description: "Side-by-side applicationId"
+        default: "su.happ.proxymodapp1"
+        required: true
+      app_label:
+        description: "Launcher app name"
+        default: "Happ Clean"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  APKTOOL_URL: https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+  SIGNER_URL: https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+jobs:
+  build-clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download tools and stock APK
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          curl -fsSL -o apktool.jar "$APKTOOL_URL"
+          curl -fsSL -o uber-apk-signer.jar "$SIGNER_URL"
+          curl -fsSL -o stock.apk "https://github.com/Happ-proxy/happ-android/releases/download/${V}/Happ.apk"
+          STOCK_SHA=$(sha256sum stock.apk | cut -d' ' -f1)
+          echo "stock sha256: $STOCK_SHA"
+          echo "STOCK_SHA=$STOCK_SHA" >> "$GITHUB_ENV"
+
+      - name: Unpack stock APK with apktool
+        run: |
+          set -euo pipefail
+          java -Xmx3g -jar apktool.jar d -f stock.apk -o work
+
+      - name: Apply clean + no-update + side-by-side patches
+        run: |
+          set -euo pipefail
+          python3 patch_happ.py work \
+            --new-id "${{ inputs.new_id }}" \
+            --app-label "${{ inputs.app_label }}"
+
+      - name: Rebuild APK with apktool
+        run: |
+          set -euo pipefail
+          APK="Happ-${{ inputs.version }}-clean-parallel.apk"
+          java -Xmx3g -jar apktool.jar b work -o "$APK"
+
+      - name: Sign & align APK
+        run: |
+          set -euo pipefail
+          APK="Happ-${{ inputs.version }}-clean-parallel.apk"
+          java -jar uber-apk-signer.jar --apks "$APK" \
+            --ks keystore/happmod.jks --ksAlias happmod \
+            --ksPass "${{ secrets.KS_PASS || 'happmod123' }}" \
+            --ksKeyPass "${{ secrets.KS_PASS || 'happmod123' }}" \
+            --allowResign --overwrite | tee sign.log
+          grep -q "zipalign verified" sign.log
+          grep -q "signature verified" sign.log
+          sha256sum "$APK" | tee SHA256SUMS
+
+      - name: Static verification of rebuilt APK
+        run: |
+          set -euo pipefail
+          APK="Happ-${{ inputs.version }}-clean-parallel.apk"
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)
+          if [ -n "$AAPT2" ]; then
+            BAD=$("$AAPT2" dump badging "$APK" 2>&1 >/dev/null | grep -c "Bad string" || true)
+            echo "bad-string warnings: $BAD"
+            test "$BAD" = "0"
+            BADGING=$("$AAPT2" dump badging "$APK" 2>/dev/null)
+            echo "$BADGING" | head -5
+            echo "$BADGING" | grep -q "package: name='${{ inputs.new_id }}'"
+            echo "$BADGING" | grep -q "application-label:'${{ inputs.app_label }}'"
+          fi
+
+          # Unpack rebuilt APK to verify patches survived compilation
+          java -Xmx3g -jar apktool.jar d -f "$APK" -o verify_work
+          python3 - verify_work "${{ inputs.new_id }}" <<'PY'
+          import os, sys, glob
+          vdir, new_id = sys.argv[1], sys.argv[2]
+          manifest = open(os.path.join(vdir, "AndroidManifest.xml"), encoding="utf-8").read()
+          assert f'package="{new_id}"' in manifest, "new package id missing"
+          for bad in (
+              "SentryInitProvider",
+              "SentryPerformanceProvider",
+              "SentryNdkPreloadProvider",
+              "FirebaseInitProvider",
+              "FirebaseMessagingService",
+              "FirebaseInstanceIdReceiver",
+              "ComponentDiscoveryService",
+              "TransportBackendDiscovery",
+              "JobInfoSchedulerService",
+              "AlarmManagerSchedulerBroadcastReceiver",
+              'authorities="su.happ.proxyutility.',
+          ):
+              assert bad not in manifest, f"Forbidden manifest entry still present: {bad}"
+
+          for pat in ("lib/*/libsentry*.so", "lib/*/libtoolChecker.so"):
+              left = glob.glob(os.path.join(vdir, pat))
+              assert not left, f"Forbidden native libs still present: {left}"
+
+          forbidden_smali = [
+              "ingest.us.sentry.io",
+              "Happ-proxy/happ-android@main/release",
+              "pastebin.com/raw/vc3ficrq",
+              "ntp2-sync.com/v1remotepush",
+              "ntp2-sync.com/v1ackpush",
+              "ntp2-sync.com/v1getpush",
+              "time-ntp.com/v1report",
+          ]
+          for d in glob.glob(os.path.join(vdir, "smali*")):
+              for root, _, names in os.walk(d):
+                  for n in names:
+                      if not n.endswith(".smali"):
+                          continue
+                      txt = open(os.path.join(root, n), encoding="utf-8", errors="ignore").read()
+                      for s in forbidden_smali:
+                          assert s not in txt, f"Forbidden string {s!r} still in {n}"
+          print("ALL STATIC VERIFICATION ASSERTIONS PASSED!")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Happ-${{ inputs.version }}-clean-parallel
+          path: |
+            Happ-${{ inputs.version }}-clean-parallel.apk
+            SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          TAG="v${V}-clean-parallel"
+          cat > notes.md <<EOF
+          Очищенная сборка Happ ${V} (без обновлений, без телеметрии, ставится рядом с оригиналом).
+
+          - Package ID: \`${{ inputs.new_id }}\` (оригинал \`su.happ.proxyutility\` не тронут)
+          - Название в лаунчере: \`${{ inputs.app_label }}\`
+          - Отключена проверка обновлений и блокировка старых версий (\`e19\` + \`l16\`)
+          - Вырезан Sentry SDK (DSN, 3 провайдера в манифесте, \`libsentry*.so\`)
+          - Отключены Firebase (FCM / Installations / DataTransport CCT) и скрытые эндпоинты \`ntp2-sync.com\` (\`v1remotepush\`, \`v1getpush\`, \`v1ackpush\`) + \`time-ntp.com/v1report\`
+          - Отключён RootBeer (\`l16.u\` + \`libtoolChecker.so\`)
+          - Базовый stock APK sha256: \`${STOCK_SHA}\`
+          EOF
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" "Happ-${V}-clean-parallel.apk" SHA256SUMS \
+            --title "Happ ${V} Clean (parallel)" \
+            --notes-file notes.md
