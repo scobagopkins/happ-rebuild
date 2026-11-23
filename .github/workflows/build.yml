@@ -1,0 +1,101 @@
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Happ version (e.g. 4.11.2)"
+        default: "4.11.2"
+        required: true
+      new_id:
+        description: "Replacement applicationId (must be the same length)"
+        default: "su.happ.proxymodapp1"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  SIGNER_URL: https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Fetch stock APK
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          curl -fsSL -o stock.apk "https://github.com/Happ-proxy/happ-android/releases/download/${V}/Happ.apk"
+          echo "stock sha256: $(sha256sum stock.apk | cut -d' ' -f1)"
+          echo "STOCK_SHA=$(sha256sum stock.apk | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Rename applicationId in the manifest only
+        run: |
+          set -euo pipefail
+          python3 axml_rename.py stock.apk "Happ-${{ inputs.version }}-parallel.apk" \
+            --new-id "${{ inputs.new_id }}"
+
+      - name: Assert nothing except the manifest changed
+        run: |
+          set -euo pipefail
+          APK="Happ-${{ inputs.version }}-parallel.apk"
+          python3 - "$APK" <<'PY'
+          import sys, zipfile
+          a = zipfile.ZipFile("stock.apk")
+          b = zipfile.ZipFile(sys.argv[1])
+          m1, m2 = a.read("AndroidManifest.xml"), b.read("AndroidManifest.xml")
+          assert len(m1) == len(m2), "manifest size changed"
+          assert a.read("resources.arsc") == b.read("resources.arsc"), "resources changed"
+          for n in a.namelist():
+              if n.endswith(".dex"):
+                  assert a.read(n) == b.read(n), f"{n} changed"
+          print("static checks: resources and dex byte-identical to stock")
+          PY
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          curl -fsSL -o uber-apk-signer.jar "$SIGNER_URL"
+          APK="Happ-${{ inputs.version }}-parallel.apk"
+          java -jar uber-apk-signer.jar --apks "$APK" \
+            --ks keystore/happmod.jks --ksAlias happmod \
+            --ksPass "${{ secrets.KS_PASS || 'happmod123' }}" \
+            --ksKeyPass "${{ secrets.KS_PASS || 'happmod123' }}" \
+            --allowResign --overwrite | tee sign.log
+          grep -q "zipalign verified" sign.log
+          grep -q "signature verified" sign.log
+          sha256sum "$APK" | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Happ-${{ inputs.version }}-parallel
+          path: |
+            Happ-${{ inputs.version }}-parallel.apk
+            SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          TAG="v${V}-parallel"
+          cat > notes.md <<EOF
+          Официальный Happ ${V}, изменён только applicationId в манифесте:
+          ${V} -> ${{ inputs.new_id }}, authorities и permission переименованы.
+
+          Код, ресурсы и нативы — байт в байт как в официальном APK.
+          stock sha256: ${STOCK_SHA}
+          EOF
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" "Happ-${V}-parallel.apk" SHA256SUMS --title "Happ ${V} parallel" --notes-file notes.md
